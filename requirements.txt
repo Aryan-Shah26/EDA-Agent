@@ -1,0 +1,14 @@
+duckdb
+pandas
+pyarrow
+scikit-learn
+langgraph
+langgraph-checkpoint-sqlite
+langchain-core
+langchain-groq
+groq
+streamlit
+pytest
+dotenv
+psutil
+matplotlib
