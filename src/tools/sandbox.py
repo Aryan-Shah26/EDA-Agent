@@ -64,8 +64,14 @@ safe_globals = {"__builtins__": safe_builtins, "pd": pd, "np": np, "df": df}
 try:
     exec(compile(user_code, "<sandboxed_code>", "exec"), safe_globals)
     result = safe_globals.get("result")
-    if hasattr(result, "to_dict"):
+    
+    # FIX 1: Protect against massive dataframes blowing up the JSON payload
+    if hasattr(result, "head"):
+        # If it's a Pandas object, only return the top 50 rows
+        result = result.head(50).to_dict()
+    elif hasattr(result, "to_dict"):
         result = result.to_dict()
+        
     with open(output_path, "w") as f:
         json.dump({"success": True, "result": result}, f, default=str)
 except Exception as e:
@@ -173,7 +179,6 @@ def run_sandboxed(code: str, dco, scratch_dir: str = None) -> dict:
                 pass
 
     if not os.path.exists(output_path):
-        # subprocess was killed before writing output - most likely RLIMIT_AS (OOM) or RLIMIT_CPU
         stderr_tail = (proc.stderr or "").strip()[-2000:]
         return {"success": False, "violations": [], "result": None,
                 "error": stderr_tail or "sandboxed process produced no output (likely killed by a resource limit)"}
@@ -181,9 +186,16 @@ def run_sandboxed(code: str, dco, scratch_dir: str = None) -> dict:
     with open(output_path) as f:
         payload = json.load(f)
     os.remove(output_path)
+    
+    # FIX 2: Attach the captured stdout! This is vital for LLMs that use print()
+    payload["stdout"] = proc.stdout.strip() if proc.stdout else ""
+    
+    # FIX 3: Ultimate safety net to truncate massive strings so the LLM doesn't crash
+    if len(str(payload.get("result"))) > 15000:
+        payload["result"] = str(payload["result"])[:15000] + "\n... [TRUNCATED: RESULT TOO LARGE]"
+        
     payload.setdefault("violations", [])
     return payload
-
 
 def run_with_self_correction(code: str, dco, fix_fn, max_attempts: int = None) -> dict:
     """

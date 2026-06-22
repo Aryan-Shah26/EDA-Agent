@@ -4,6 +4,7 @@ Chat section. Handles two modes based on enable_hitl:
   - HITL on:  first invoke() pauses at human_approval; the pending tool
               call(s) are rendered in an approve/reject widget. On user
               action, Command(resume=True/False) continues the graph.
+
 API key is loaded from environment via llm_router.get_llm() - not from
 session state.
 """
@@ -76,9 +77,17 @@ def _render_pending_approval():
         result = _get_graph().invoke(Command(resume=approved), config=_graph_config())
 
     last = result["messages"][-1]
+    
+    # 1. If accepted and LLM responded normally
     if last.type == "ai" and last.content:
         st.session_state.chat_messages.append({"role": "assistant", "content": last.content})
         st.session_state.chat_memory.add("assistant", last.content)
+        
+    # 2. If rejected, the graph ends on a ToolMessage. Handle it gracefully.
+    elif not approved:
+        st.session_state.chat_messages.append({"role": "assistant", "content": "❌ Tool execution cancelled by user."})
+        st.session_state.chat_memory.add("assistant", "❌ Tool execution cancelled by user.")
+
     return True
 
 
@@ -124,12 +133,28 @@ def render_chat_section():
             config=config,
         )
 
-    if graph.get_state(config).next == ("human_approval",):
+    snap = graph.get_state(config)
+    if snap.next == ("human_approval",):
         st.rerun()
         return
 
-    response_text = result["messages"][-1].content
-    st.session_state.chat_messages.append({"role": "assistant", "content": response_text})
-    with st.chat_message("assistant"):
-        st.write(response_text)
-    st.session_state.chat_memory.add("assistant", response_text)
+    last_msg = result["messages"][-1]
+    response_text = last_msg.content
+
+    # Fallback: if the agent's closing message is empty (it decided the tool
+    # result speaks for itself), surface the last ToolMessage content instead.
+    if not response_text:
+        tool_msgs = [m for m in result["messages"] if hasattr(m, "name") and m.name == "run_python_code"]
+        if tool_msgs:
+            import json as _json
+            try:
+                payload = _json.loads(tool_msgs[-1].content)
+                response_text = f"```\n{_json.dumps(payload.get('result', payload), indent=2, default=str)}\n```"
+            except Exception:
+                response_text = tool_msgs[-1].content
+
+    if response_text:
+        st.session_state.chat_messages.append({"role": "assistant", "content": response_text})
+        with st.chat_message("assistant"):
+            st.write(response_text)
+        st.session_state.chat_memory.add("assistant", response_text)

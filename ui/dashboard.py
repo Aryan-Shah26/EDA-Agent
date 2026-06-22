@@ -9,9 +9,10 @@ provider is wired in this build yet); LLM-cost ones only appear once a
 Groq API key is set.
 """
 import os
-import os
 import tempfile
 import streamlit as st
+import pandas as pd
+import numpy as np
 
 from src.ingestion.profiler import profile_dataset, get_class_counts
 from src.target_analysis.detector import detect_target_candidates
@@ -24,30 +25,138 @@ from .render import render_result
 
 def render_upload_section():
     uploaded = st.file_uploader("Upload a CSV or Parquet file", type=["csv", "parquet"])
+    
     if uploaded is None:
+        st.session_state.current_upload_signature = None
         return
+
+    file_signature = f"{uploaded.name}_{uploaded.size}"
+    if st.session_state.get("current_upload_signature") == file_signature:
+        return  
 
     suffix = os.path.splitext(uploaded.name)[1]
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(uploaded.getbuffer())
         csv_path = tmp.name
 
-    if st.session_state.csv_path != csv_path:
-        with st.spinner("Profiling dataset (DuckDB, out-of-core - safe for large files)..."):
-            st.session_state.dco = profile_dataset(csv_path)
-        st.session_state.csv_path = csv_path
-        st.session_state.process_results = {}
+    with st.spinner("Profiling dataset (DuckDB, out-of-core - safe for large files)..."):
+        st.session_state.dco = profile_dataset(csv_path)
+        
+    st.session_state.csv_path = csv_path
+    st.session_state.process_results = {}
+    st.session_state.current_upload_signature = file_signature
 
 
-def render_target_section():
+def _get_optimization_insight(prof, sample_series):
+    """
+    Evaluates a column profile against strict memory bounds and formatting heuristics
+    to recommend data type downcasting or datetime conversions.
+    """
+    dtype = prof.dtype.upper()
+    
+    # 1. Float Downcasting
+    if dtype in ["DOUBLE", "FLOAT", "REAL"] and prof.min_val is not None and prof.max_val is not None:
+        if prof.min_val >= np.finfo(np.float16).min and prof.max_val <= np.finfo(np.float16).max:
+            return "Downcast to float16"
+        elif prof.min_val >= np.finfo(np.float32).min and prof.max_val <= np.finfo(np.float32).max and dtype == "DOUBLE":
+            return "Downcast to float32"
+            
+    # 2. Integer Downcasting
+    elif dtype in ["BIGINT", "INTEGER", "HUGEINT", "SMALLINT", "TINYINT"] and prof.min_val is not None and prof.max_val is not None:
+        if prof.min_val >= np.iinfo(np.uint8).min and prof.max_val <= np.iinfo(np.uint8).max:
+            return "Downcast to uint8"
+        elif prof.min_val >= np.iinfo(np.int8).min and prof.max_val <= np.iinfo(np.int8).max:
+            return "Downcast to int8"
+        elif prof.min_val >= np.iinfo(np.uint16).min and prof.max_val <= np.iinfo(np.uint16).max:
+            return "Downcast to uint16"
+        elif prof.min_val >= np.iinfo(np.int16).min and prof.max_val <= np.iinfo(np.int16).max:
+            return "Downcast to int16"
+        elif prof.min_val >= np.iinfo(np.uint32).min and prof.max_val <= np.iinfo(np.uint32).max:
+            return "Downcast to uint32"
+        elif prof.min_val >= np.iinfo(np.int32).min and prof.max_val <= np.iinfo(np.int32).max and dtype in ["BIGINT", "HUGEINT"]:
+            return "Downcast to int32"
+            
+    # 3. Object to Datetime (Heuristic)
+    elif dtype in ["VARCHAR", "TEXT", "OBJECT"] and sample_series is not None:
+        s = sample_series.dropna().head(50)
+        # Check if it has typical date separators to avoid falsely parsing raw numbers
+        if len(s) > 0 and s.astype(str).str.contains(r'[-/:]').all():
+            try:
+                pd.to_datetime(s, errors='raise')
+                return "Convert to Datetime"
+            except Exception:
+                pass
+                
+    return "-"
+
+def render_data_profile_tab():
     dco = st.session_state.dco
-    if dco is None:
-        return
+    st.subheader("Dataset Overview")
+    
+    st.write(f"**Rows:** `{dco.n_rows:,}` | **Columns:** `{dco.n_cols}`")
+    
+    flags = dco.flags
+    if flags:
+        for f in flags:
+            level = {"critical": st.error, "warning": st.warning}.get(f.severity, st.info)
+            level(f"[{f.column or 'Dataset'}] {f.message}")
+    else:
+        st.success("No critical health flags detected.")
+        
+    st.divider()
+    
+    # Load sample df once for the whole tab
+    sample_df = None
+    if dco.reservoir_sample_path and os.path.exists(dco.reservoir_sample_path):
+        sample_df = pd.read_parquet(dco.reservoir_sample_path)
+        
+    # --- Row 1: Full Width Data Sample ---
+    st.markdown("#### Data Sample")
+    if sample_df is not None:
+        st.dataframe(sample_df.head(10), use_container_width=True)
+    else:
+        st.caption("No sample data available.")
+            
+    st.divider()
+    
+    # --- Row 2: Full Width Dictionary & Statistics ---
+    st.markdown("#### Column Dictionary & Statistics")
+    schema_data = []
+    for col_name, prof in dco.columns.items():
+        sample_series = sample_df[col_name] if sample_df is not None and col_name in sample_df.columns else None
+        insight = _get_optimization_insight(prof, sample_series)
+        
+        mean_val = f"{prof.mean:.2f}" if prof.mean is not None else "-"
+        std_val = f"{prof.std:.2f}" if prof.std is not None else "-"
+        
+        min_val = f"{prof.min_val}" if prof.min_val is not None else "-"
+        max_val = f"{prof.max_val}" if prof.max_val is not None else "-"
+        
+        schema_data.append({
+            "Column": col_name, 
+            "Type": prof.dtype, 
+            "Nulls": f"{prof.null_pct:.1%}",
+            "Min": min_val,
+            "Max": max_val,
+            "Mean": mean_val,
+            "Std": std_val,
+            "Optimization": insight,
+        })
+        
+    st.dataframe(pd.DataFrame(schema_data), hide_index=True, use_container_width=True)
+        
+    st.divider()
+    st.markdown("#### Domain Context")
+    st.caption("Fetch external context (Web/LLM) to help the agent understand this dataset.")
+    render_category_checklist(None, "context")
 
-    st.subheader("Target column")
 
+def render_target_tab():
+    dco = st.session_state.dco
+    
+    st.subheader("Target Configuration")
     if dco.target.confirmed_by_user and dco.target.column:
-        st.success(f"Target: **{dco.target.column}**")
+        st.success(f"Confirmed Target: **{dco.target.column}**")
         for f in (dco.target.health or {}).get("flags", []):
             level = {"critical": st.error, "warning": st.warning}.get(f["severity"], st.info)
             level(f["detail"])
@@ -55,48 +164,85 @@ def render_target_section():
             dco.target.confirmed_by_user = False
             dco.target.column = None
             st.rerun()
+    else:
+        candidates = dco.target.candidates or detect_target_candidates(dco)
+        dco.target.candidates = candidates
+        candidate_names = [c["column"] for c in candidates]
+        other_columns = [c for c in dco.columns if c not in candidate_names]
+        options = ["-- none --"] + candidate_names + other_columns
+
+        choice = st.selectbox(
+            "Select a target/label column to predict:",
+            options, index=1 if candidates else 0,
+        )
+        if choice != "-- none --" and st.button("Confirm target", type="primary"):
+            class_counts = get_class_counts(st.session_state.csv_path, choice)
+            health = audit_target_health(dco, choice, class_counts=class_counts)
+            dco.target.column = choice
+            dco.target.confirmed_by_user = True
+            dco.target.health = health
+            st.rerun()
+            
+    st.divider()
+    
+    if not dco.target.column:
+        st.info("Please select and confirm a Target Column above to unlock target analysis.")
         return
 
-    candidates = dco.target.candidates or detect_target_candidates(dco)
-    dco.target.candidates = candidates
-    candidate_names = [c["column"] for c in candidates]
-    other_columns = [c for c in dco.columns if c not in candidate_names]
-    options = ["-- none --"] + candidate_names + other_columns
+    st.markdown(f"#### Target Analysis: `{dco.target.column}`")
+    
+    # Filter only processes that REQUIRE a target
+    target_processes = [s for s in REGISTRY.list() if s.requires_target]
+    
+    if not target_processes:
+        st.warning("No target processes registered yet.")
+        return
 
-    choice = st.selectbox(
-        "Does this dataset have a target/label column to predict?",
-        options, index=1 if candidates else 0,
-    )
-    if choice != "-- none --" and st.button("Confirm target"):
-        class_counts = get_class_counts(st.session_state.csv_path, choice)
-        health = audit_target_health(dco, choice, class_counts=class_counts)
-        dco.target.column = choice
-        dco.target.confirmed_by_user = True
-        dco.target.health = health
-        st.rerun()
+    selected_target_procs = []
+    cols = st.columns(2)
+    for i, spec in enumerate(target_processes):
+        display_name = spec.name.replace("_", " ").title()
+        with cols[i % 2]:
+            if st.checkbox(f"{display_name} ({spec.cost.value})", value=True, help=spec.description, key=f"tgt_{spec.name}"):
+                selected_target_procs.append(spec.name)
+
+    if st.button("Run Target Analysis", type="primary", key="btn_run_target"):
+        placeholders = {name: st.empty() for name in selected_target_procs}
+        for name, result in run_selected(selected_target_procs, dco=dco):
+            with placeholders[name].container():
+                render_result(name, result)
 
 
-def render_process_checklist():
+def render_category_checklist(title: str, category: str):
     dco = st.session_state.dco
-    if dco is None:
-        return
+    if not dco: return
 
-    st.subheader("Run analyses")
+    if title:
+        st.subheader(title)
+        
     eligible = [
         s for s in REGISTRY.list()
-        if not (s.requires_target and not dco.target.column)
+        if s.category == category
+        and not s.requires_target  # Exclude target-specific tools from general tabs
         and s.cost != ProcessCost.NETWORK
         and not (s.cost == ProcessCost.LLM and not os.getenv("GROQ_API_KEY"))
     ]
+
+    if not eligible:
+        st.info("No processes available for this category.")
+        return
 
     selected = []
     cols = st.columns(2)
     for i, spec in enumerate(eligible):
         with cols[i % 2]:
-            if st.checkbox(f"{spec.name} ({spec.cost.value})", help=spec.description, key=f"chk_{spec.name}"):
+            display_name = spec.name.replace("_", " ").title() # Clean Snake Case
+            # Set value=True to check by default
+            if st.checkbox(f"{display_name} ({spec.cost.value})", value=True, help=spec.description, key=f"chk_{spec.name}_{category}"):
                 selected.append(spec.name)
 
-    if st.button("Run selected", disabled=not selected):
+    btn_key = f"run_btn_{category}"
+    if st.button("Run selected", disabled=not selected, type="primary", key=btn_key):
         kwargs = {"dco": dco}
         if any(REGISTRY.get(n).cost == ProcessCost.LLM for n in selected):
             fast_llm = st.session_state.get("_test_fast_llm_override") or get_llm("fast")
@@ -109,4 +255,5 @@ def render_process_checklist():
                 render_result(name, result)
     else:
         for name, result in st.session_state.process_results.items():
-            render_result(name, result)
+            if REGISTRY.get(name).category == category:
+                render_result(name, result)

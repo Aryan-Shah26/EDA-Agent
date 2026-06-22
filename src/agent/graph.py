@@ -49,15 +49,11 @@ def build_graph(
     enable_hitl: bool = False,
 ):
     """
-    Wires the agent<->tools loop. When enable_hitl=True, a human_approval
-    node is inserted between agent and tools; the graph pauses there via
-    interrupt(), surfacing the pending tool call(s) to whatever calls
-    graph.get_state(config). The caller resumes with:
+    Wires the agent<->tools loop. When enable_hitl=True, a human_approval node is inserted between agent and tools; the graph pauses there via interrupt(), surfacing the pending tool call(s) to whatever calls graph.get_state(config). The caller resumes with:
       - Command(resume=True)  -> tool executes, agent continues
-      - Command(resume=False) -> synthetic ToolMessage injected, agent
-                                 sees 'rejected' and replies gracefully
-    A checkpointer is REQUIRED for HITL (graph state must survive between
-    the pause and the resume call).
+      - Command(resume=False) -> synthetic ToolMessage injected, agent sees 'rejected' and replies gracefully
+
+    A checkpointer is REQUIRED for HITL (graph state must survive betweenthe pause and the resume call).
     """
     if enable_hitl and checkpointer is None:
         raise ValueError("enable_hitl=True requires a checkpointer - graph state must persist between interrupt and resume")
@@ -76,26 +72,28 @@ def build_graph(
     def human_approval_node(state: AgentState):
         """
         Pauses via interrupt(), surfacing pending tool_calls to the UI.
-        The interrupt payload is {pending_tool_calls: [...]} - the UI can
-        render each tool name + args for the user to inspect.
+        The interrupt payload is {pending_tool_calls: [...]} - the UI can render each tool name + args for the user to inspect.
         On resume:
           True  -> sets __approved=True, approval_router sends to tools
-          False -> injects ToolMessage(rejected) per pending call so the
-                   agent gets a clean response without a dangling tool_call id,
-                   then routes back to agent
+          False -> injects ToolMessage(rejected) per pending call so the agent gets a clean response without a dangling    tool_call id, then routes back to agent
         """
         last_msg = state["messages"][-1]
         approved = interrupt({"pending_tool_calls": last_msg.tool_calls})
         if not approved:
             rejection_messages = [
                 ToolMessage(
-                    content="Tool call rejected by user.",
+                    content=(
+                        "USER OVERRIDE: This tool call was explicitly REJECTED by the user. "
+                        "DO NOT retry this tool. DO NOT propose it again. "
+                        "Acknowledge the rejection and provide a fallback textual response instead."
+                    ),
                     tool_call_id=tc["id"],
                     name=tc["name"],
                 )
                 for tc in last_msg.tool_calls
             ]
             return {"messages": rejection_messages, "__approved": False}
+            
         return {"__approved": True}
 
     def approval_router(state: AgentState) -> str:

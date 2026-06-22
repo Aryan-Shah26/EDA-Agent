@@ -64,10 +64,26 @@ def build_sandbox_tool(dco: DataContextObject, fix_fn: Optional[Callable[[str, s
     risk than a fixed registered function, so it's opt-in via enable_sandbox=
     rather than always offered.
     """
-    def _run(code: str) -> dict:
+    def _run(code: str) -> str:
+        """Returns result as a formatted string so the agent can narrate it
+        directly rather than receiving an opaque dict blob."""
+        import json as _json
         if fix_fn is not None:
-            return run_with_self_correction(code, dco, fix_fn)
-        return run_sandboxed(code, dco)
+            payload = run_with_self_correction(code, dco, fix_fn)
+        else:
+            payload = run_sandboxed(code, dco)
+
+        if not payload["success"]:
+            violations = payload.get("violations")
+            if violations:
+                return f"Code rejected (security): {'; '.join(violations)}"
+            return f"Execution failed: {payload.get('error', 'unknown error')}"
+
+        result = payload.get("result")
+        try:
+            return _json.dumps(result, indent=2, default=str)
+        except Exception:
+            return str(result)
 
     return StructuredTool.from_function(
         func=_run,

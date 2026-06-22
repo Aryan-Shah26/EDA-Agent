@@ -23,32 +23,53 @@ DATETIME_TYPES = {"DATE", "TIMESTAMP", "TIMESTAMP WITH TIME ZONE", "TIME"}
 def suggest_feature_engineering(dco: DataContextObject, **_) -> dict:
     """
     Walks every column once and emits at most one suggestion category per
-    column (skew transform, encoding strategy, datetime decomposition, or
-    missingness handling) - whichever applies. Each suggestion carries the
-    actual statistic that triggered it, not just a generic recommendation.
+    column. Sorted by precedence: Missingness -> Identifiers -> Datetime -> Skew -> Encoding.
     """
     cfg = CONFIG.feature_model
     suggestions = []
 
     for name, prof in dco.columns.items():
         if name == dco.target.column:
-            continue  # the target isn't a feature to transform - audited separately in health_audit.py
+            continue
 
         dtype = prof.dtype.upper()
+        distinct = prof.distinct_count or 0
+        distinct_ratio = distinct / dco.n_rows if dco.n_rows else 0
 
+        # 1. PRIORITY: Missing Data
+        # (Moved to the top so columns like 'Cabin' get flagged for nulls first)
+        if prof.null_pct > cfg.high_null_threshold:
+            suggestions.append({
+                "column": name, "kind": "missingness",
+                "detail": f"{prof.null_pct:.1%} null",
+                "suggestion": "median/mode imputation with a missingness indicator column, or "
+                              "consider dropping if this rate persists in the full data",
+            })
+            continue
+
+        # 2. IDENTIFIER CHECK (New Rule)
+        # If a text column is almost entirely unique, it's an ID, Name, or raw text.
+        if dtype not in NUMERIC_TYPES and dtype not in DATETIME_TYPES:
+            if distinct_ratio > 0.85 and dco.n_rows > 50:
+                suggestions.append({
+                    "column": name, "kind": "drop_identifier",
+                    "detail": f"{distinct_ratio:.0%} unique",
+                    "suggestion": "Drop column. High uniqueness indicates a primary key, name, or raw string that will cause overfitting.",
+                })
+                continue
+
+        # 3. Datetime Extraction
         if dtype in DATETIME_TYPES:
             suggestions.append({
                 "column": name, "kind": "datetime_decomposition",
                 "detail": f"{name} is {prof.dtype}",
-                "suggestion": "extract hour/day/day-of-week/month components; consider cyclical "
-                              "(sin/cos) encoding for hour and day-of-week instead of raw integers",
+                "suggestion": "extract hour/day/month components; consider cyclical "
+                              "(sin/cos) encoding for hour/day instead of raw integers",
             })
             continue
 
-        # Skew is only meaningful for genuinely continuous columns - a binary/low-cardinality
-        # numeric (e.g. a 0/1 flag stored as BIGINT) can show extreme "skew" purely from class
-        # imbalance, and log-transforming a flag column is meaningless.
-        is_continuous_numeric = dtype in NUMERIC_TYPES and (prof.distinct_count or 0) > 20
+        # 4. Continuous Numeric Skew
+        is_continuous_numeric = dtype in NUMERIC_TYPES and distinct > 20
         if is_continuous_numeric and prof.skew is not None and abs(prof.skew) > cfg.skew_threshold:
             transform = "log1p" if prof.skew > 0 else "square or Box-Cox (left-skewed)"
             suggestions.append({
@@ -58,21 +79,14 @@ def suggest_feature_engineering(dco: DataContextObject, **_) -> dict:
             })
             continue
 
-        if dtype not in NUMERIC_TYPES and (prof.distinct_count or 0) > cfg.high_cardinality_threshold:
+        # 5. Standard High Cardinality Categorical
+        if dtype not in NUMERIC_TYPES and distinct > cfg.high_cardinality_threshold:
             suggestions.append({
                 "column": name, "kind": "high_cardinality_encoding",
-                "detail": f"distinct≈{prof.distinct_count}",
+                "detail": f"distinct≈{distinct}",
                 "suggestion": "use target or frequency encoding, not one-hot (would create "
-                              f"{prof.distinct_count}+ sparse columns)",
+                              f"{distinct}+ sparse columns)",
             })
             continue
-
-        if prof.null_pct > cfg.high_null_threshold:
-            suggestions.append({
-                "column": name, "kind": "missingness",
-                "detail": f"{prof.null_pct:.1%} null",
-                "suggestion": "median/mode imputation with a missingness indicator column, or "
-                              "consider dropping if this rate persists in the full (non-sample) data",
-            })
 
     return {"type": "table", "data": suggestions}

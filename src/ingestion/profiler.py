@@ -33,45 +33,59 @@ def profile_dataset(
     con: "duckdb.DuckDBPyConnection | None" = None,
 ) -> DataContextObject:
     """
-    Build a DataContextObject for `path` without ever materializing the full
-    file in Python memory. DuckDB computes per-column null/distinct/min/max/
-    mean/std stats as out-of-core aggregations; only a small reservoir
-    sample (sample_size rows) is ever pulled into a pandas-readable form,
-    and that happens via a COPY straight to parquet, not via .df() on the
-    full table. sample_size/sample_dir default to CONFIG.ingestion if not
-    passed explicitly.
+    Build a DataContextObject using a single-pass mega-query.
+    Scans the dataset exactly ONCE regardless of column count.
     """
     sample_size = CONFIG.ingestion.sample_size if sample_size is None else sample_size
     sample_dir = CONFIG.ingestion.sample_dir if sample_dir is None else sample_dir
     own_con = con is None
     con = con or duckdb.connect()
+    
     try:
         rel = _read_expr(path)
 
         schema_df = con.sql(f"DESCRIBE SELECT * FROM {rel}").df()
         n_rows = con.sql(f"SELECT COUNT(*) FROM {rel}").fetchone()[0]
 
-        columns: dict[str, ColumnProfile] = {}
+        # 1. Build the Mega-Query
+        select_exprs = []
+        col_meta = []
+        
         for _, row in schema_df.iterrows():
             col, dtype = row["column_name"], row["column_type"]
             is_numeric = dtype.upper() in NUMERIC_TYPES
             qcol = f'"{col}"'
-
-            agg = [
-                f"COUNT(*) FILTER (WHERE {qcol} IS NULL) AS null_count",
-                f"approx_count_distinct({qcol}) AS distinct_count",
-            ]
+            
+            col_meta.append((col, dtype, is_numeric))
+            
+            # Base stats for all columns
+            select_exprs.append(f"COUNT(*) FILTER (WHERE {qcol} IS NULL)")
+            select_exprs.append(f"approx_count_distinct({qcol})")
+            
+            # Additional stats for numeric columns
             if is_numeric:
-                agg += [
-                    f"MIN({qcol}) AS min_val",
-                    f"MAX({qcol}) AS max_val",
-                    f"AVG({qcol})::DOUBLE AS mean_val",
-                    f"STDDEV({qcol})::DOUBLE AS std_val",
-                    f"SKEWNESS({qcol})::DOUBLE AS skew_val",
-                ]
-            stats = con.sql(f"SELECT {', '.join(agg)} FROM {rel}").fetchone()
-            null_count = stats[0]
-            distinct_count = stats[1]
+                select_exprs.extend([
+                    f"MIN({qcol})",
+                    f"MAX({qcol})",
+                    f"AVG({qcol})::DOUBLE",
+                    f"STDDEV({qcol})::DOUBLE",
+                    f"SKEWNESS({qcol})::DOUBLE"
+                ])
+
+        # 2. Execute the single query
+        if select_exprs:
+            mega_query = f"SELECT {', '.join(select_exprs)} FROM {rel}"
+            row_data = con.sql(mega_query).fetchone()
+        else:
+            row_data = []
+
+        # 3. Unpack the results into the DataContextObject
+        columns: dict[str, ColumnProfile] = {}
+        idx = 0
+        
+        for col, dtype, is_numeric in col_meta:
+            null_count = row_data[idx]; idx += 1
+            distinct_count = row_data[idx]; idx += 1
 
             prof = ColumnProfile(
                 name=col,
@@ -81,13 +95,21 @@ def profile_dataset(
                 distinct_count=distinct_count,
                 distinct_is_approx=True,
             )
+            
             if is_numeric:
-                prof.min_val, prof.max_val, prof.mean, prof.std, prof.skew = stats[2], stats[3], stats[4], stats[5], stats[6]
+                prof.min_val = row_data[idx]; idx += 1
+                prof.max_val = row_data[idx]; idx += 1
+                prof.mean = row_data[idx]; idx += 1
+                prof.std = row_data[idx]; idx += 1
+                prof.skew = row_data[idx]; idx += 1
+
             columns[col] = prof
 
+        # 4. Generate the Reservoir Sample
         os.makedirs(sample_dir, exist_ok=True)
         sample_path = os.path.join(sample_dir, f"{os.path.basename(path)}.sample.parquet")
         effective_sample = min(sample_size, n_rows) if n_rows else sample_size
+        
         if effective_sample > 0:
             con.sql(
                 f"COPY (SELECT * FROM {rel} USING SAMPLE {effective_sample} ROWS (reservoir)) "
@@ -113,10 +135,10 @@ def profile_dataset(
                 dco.add_flag("constant_column", "info", "Only one distinct value", column=col)
 
         return dco
+        
     finally:
         if own_con:
             con.close()
-
 
 def query_full_data(path: str, sql_select_clause: str, con: "duckdb.DuckDBPyConnection | None" = None):
     """
