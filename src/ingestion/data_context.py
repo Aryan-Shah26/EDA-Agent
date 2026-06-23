@@ -24,6 +24,7 @@ class ColumnProfile:
     mean: Optional[float] = None
     std: Optional[float] = None
     skew: Optional[float] = None
+    description: str = "No domain context provided."
 
 
 @dataclass

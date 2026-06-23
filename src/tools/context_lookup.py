@@ -39,6 +39,15 @@ def llm_context_lookup(dco: DataContextObject, llm_fn=None, **_):
     schema_desc = ", ".join(f"{n} ({p.dtype})" for n, p in dco.columns.items())
     prompt = (
         f"Dataset '{dco.source_name}' has columns: {schema_desc}. "
-        "In 3-4 sentences, what domain is this likely from and what do the columns probably represent?"
+        '''--- FORMATTING RULES ---
+        You must format your response strictly as a bulleted list. 
+        Each column must be on a new line.
+        You must wrap the exact column name in backticks (`).
+        DO NOT use asterisks or bolding for the column name.
+        Do not include any introductory or concluding paragraphs.
+        
+        Example Output Format:
+        * `Column_Name_1`: This represents the first description...
+        * `Column_Name_2`: This represents the second description...'''
     )
     return {"type": "text", "data": llm_fn(prompt)}

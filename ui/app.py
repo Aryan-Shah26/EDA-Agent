@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src import bootstrap
 from ui.state import init_session_state
-from ui.dashboard import render_upload_section, render_target_tab, render_category_checklist, render_data_profile_tab
+from ui.dashboard import render_upload_section, render_target_tab, render_category_checklist, render_data_profile_tab, render_automl_tab
 from ui.chat import render_chat_section
 
 st.set_page_config(page_title="EDA Agent V4", layout="wide")
@@ -47,12 +47,13 @@ with st.sidebar:
 # MAIN CANVAS (The 6 Tabs)
 # ==========================================
 if st.session_state.dco is not None:
-    tab_profile, tab_target, tab_math, tab_viz, tab_clean, tab_chat = st.tabs([
+    tab_profile, tab_target, tab_math, tab_viz, tab_clean, tab_automl, tab_chat = st.tabs([
         "Data Profile", 
         "Target Analysis", 
         "EDA", 
         "Visualizations", 
         "Data Cleaning & Eng", 
+        "AutoML",
         "AI Co-Pilot"
     ])
     
@@ -71,6 +72,9 @@ if st.session_state.dco is not None:
     with tab_clean:
         # Maps to model_suggestion category (Feature Eng, Outliers, Nulls)
         render_category_checklist("Cleaning, Outliers & Feature Engineering", "model_suggestion")
+    
+    with tab_automl:
+        render_automl_tab()
         
     with tab_chat:
         render_chat_section()

@@ -7,9 +7,19 @@ without a UI at all.
 """
 import pandas as pd
 import numpy as np
+import streamlit as st
+import json
+
+from src.agent.llm_router import get_llm
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import accuracy_score, f1_score, r2_score, mean_absolute_error
 
 from .registry import process, ProcessCost
 from ..ingestion.data_context import DataContextObject
+
 
 NUMERIC_DTYPES = {"BIGINT", "DOUBLE", "INTEGER", "FLOAT", "DECIMAL", "HUGEINT", "SMALLINT", "TINYINT", "REAL"}
 
@@ -72,47 +82,47 @@ def distribution_summary(dco: DataContextObject, **_):
     return {"type": "multi_chart", "data": result}
 
 
-@process(
-    name="outlier_detection",
-    description="Tiered outlier detection: Isolation Forest + mutual-information scoring on numeric columns (sample-based).",
-    cost=ProcessCost.FREE,
-    category="model_suggestion",
-)
-def outlier_detection(dco: DataContextObject, **_):
-    """
-    Two-stage outlier detection on the reservoir sample:
-      1. Isolation Forest flags which ROWS are outliers (unsupervised,
-         works without knowing what "normal" looks like ahead of time).
-      2. Mutual information between each numeric COLUMN and the binary
-         outlier flag ranks which columns actually drive those flags -
-         this is what makes the result actionable ("amount and tenure
-         explain most outliers") instead of just a count.
-    Returns early with a note if there's too little numeric data, or if
-    every row (or no row) was flagged - MI is undefined/meaningless then.
-    """
-    from sklearn.ensemble import IsolationForest
-    from sklearn.feature_selection import mutual_info_classif
+# @process(
+#     name="outlier_detection",
+#     description="Tiered outlier detection: Isolation Forest + mutual-information scoring on numeric columns (sample-based).",
+#     cost=ProcessCost.FREE,
+#     category="model_suggestion",
+# )
+# def outlier_detection(dco: DataContextObject, **_):
+#     """
+#     Two-stage outlier detection on the reservoir sample:
+#       1. Isolation Forest flags which ROWS are outliers (unsupervised,
+#          works without knowing what "normal" looks like ahead of time).
+#       2. Mutual information between each numeric COLUMN and the binary
+#          outlier flag ranks which columns actually drive those flags -
+#          this is what makes the result actionable ("amount and tenure
+#          explain most outliers") instead of just a count.
+#     Returns early with a note if there's too little numeric data, or if
+#     every row (or no row) was flagged - MI is undefined/meaningless then.
+#     """
+#     from sklearn.ensemble import IsolationForest
+#     from sklearn.feature_selection import mutual_info_classif
 
-    df = _load_sample(dco)
-    numeric = df.select_dtypes(include="number").dropna(axis=1, how="all")
-    if numeric.shape[1] == 0 or len(numeric) < 20:
-        return {"type": "table", "data": [], "note": "insufficient numeric data for outlier detection"}
+#     df = _load_sample(dco)
+#     numeric = df.select_dtypes(include="number").dropna(axis=1, how="all")
+#     if numeric.shape[1] == 0 or len(numeric) < 20:
+#         return {"type": "table", "data": [], "note": "insufficient numeric data for outlier detection"}
 
-    filled = numeric.fillna(numeric.median())
-    iso = IsolationForest(contamination="auto", random_state=42)
-    is_outlier = (iso.fit_predict(filled) == -1).astype(int)
+#     filled = numeric.fillna(numeric.median())
+#     iso = IsolationForest(contamination="auto", random_state=42)
+#     is_outlier = (iso.fit_predict(filled) == -1).astype(int)
 
-    if is_outlier.sum() == 0 or is_outlier.sum() == len(is_outlier):
-        return {"type": "table", "outlier_count": int(is_outlier.sum()), "outlier_pct": round(float(is_outlier.mean()), 4), "top_contributing_columns": []}
+#     if is_outlier.sum() == 0 or is_outlier.sum() == len(is_outlier):
+#         return {"type": "table", "outlier_count": int(is_outlier.sum()), "outlier_pct": round(float(is_outlier.mean()), 4), "top_contributing_columns": []}
 
-    mi = mutual_info_classif(filled, is_outlier, random_state=42)
-    contributors = sorted(zip(filled.columns, mi), key=lambda x: x[1], reverse=True)
-    return {
-        "type": "table",
-        "outlier_count": int(is_outlier.sum()),
-        "outlier_pct": round(float(is_outlier.mean()), 4),
-        "top_contributing_columns": [{"column": c, "mutual_info": round(float(m), 4)} for c, m in contributors[:10]],
-    }
+#     mi = mutual_info_classif(filled, is_outlier, random_state=42)
+#     contributors = sorted(zip(filled.columns, mi), key=lambda x: x[1], reverse=True)
+#     return {
+#         "type": "table",
+#         "outlier_count": int(is_outlier.sum()),
+#         "outlier_pct": round(float(is_outlier.mean()), 4),
+#         "top_contributing_columns": [{"column": c, "mutual_info": round(float(m), 4)} for c, m in contributors[:10]],
+#     }
 
 @process(
     name="target_correlation_rank",
@@ -195,10 +205,6 @@ def feature_vs_target_distributions(dco: DataContextObject, **_):
     category="model_suggestion",
 )
 def data_cleaning_plan(dco: DataContextObject, **_):
-    """
-    Adapts the V2 null_tools.py logic. Uses the DataContextObject to recommend
-    the exact cleaning step needed for every column with missing values.
-    """
     NULL_DROP_THRESHOLD = 0.60
     
     plan = []
@@ -247,61 +253,56 @@ def data_cleaning_plan(dco: DataContextObject, **_):
     return {"type": "table", "data": plan}
 
 
-@process(
-    name="univariate_outlier_fences",
-    description="Calculates IQR fences for numeric columns and recommends capping (Winsorization) vs. dropping.",
-    cost=ProcessCost.FREE,
-    category="statistic",
-)
-def univariate_outlier_fences(dco: DataContextObject, **_):
-    """
-    Adapts the V2 outlier_tools.py logic. Computes exact IQR fences on the
-    reservoir sample and suggests Cap vs Drop based on outlier volume.
-    """
-    df = _load_sample(dco)
-    numeric_cols = df.select_dtypes(include="number").columns
+# @process(
+#     name="univariate_outlier_fences",
+#     description="Calculates IQR fences for numeric columns and recommends capping (Winsorization) vs. dropping.",
+#     cost=ProcessCost.FREE,
+#     category="statistic",
+# )
+# def univariate_outlier_fences(dco: DataContextObject, **_):
+#     df = _load_sample(dco)
+#     numeric_cols = df.select_dtypes(include="number").columns
     
-    OUTLIER_DROP_MAX_PCT = 0.02 # From V2 config
+#     OUTLIER_DROP_MAX_PCT = 0.02 # From V2 config
     
-    results = []
-    for col in numeric_cols:
-        series = df[col].dropna()
-        if len(series) < 20:
-            continue
+#     results = []
+#     for col in numeric_cols:
+#         series = df[col].dropna()
+#         if len(series) < 20:
+#             continue
             
-        q1 = series.quantile(0.25)
-        q3 = series.quantile(0.75)
-        iqr = q3 - q1
-        lower_fence = q1 - 1.5 * iqr
-        upper_fence = q3 + 1.5 * iqr
+#         q1 = series.quantile(0.25)
+#         q3 = series.quantile(0.75)
+#         iqr = q3 - q1
+#         lower_fence = q1 - 1.5 * iqr
+#         upper_fence = q3 + 1.5 * iqr
         
-        # Count outliers in the sample
-        outliers = series[(series < lower_fence) | (series > upper_fence)]
-        outlier_count = len(outliers)
-        outlier_pct = outlier_count / len(series)
+#         # Count outliers in the sample
+#         outliers = series[(series < lower_fence) | (series > upper_fence)]
+#         outlier_count = len(outliers)
+#         outlier_pct = outlier_count / len(series)
         
-        if outlier_count == 0:
-            continue
+#         if outlier_count == 0:
+#             continue
             
-        action = "Drop Rows" if outlier_pct <= OUTLIER_DROP_MAX_PCT else "Cap (Winsorize)"
-        reason = f"Outliers make up {outlier_pct:.2%} of data. " + \
-                 ("Safe to drop." if action == "Drop Rows" else "Too many to drop; capping is safer.")
+#         action = "Drop Rows" if outlier_pct <= OUTLIER_DROP_MAX_PCT else "Cap (Winsorize)"
+#         reason = f"Outliers make up {outlier_pct:.2%} of data. " + \
+#                  ("Safe to drop." if action == "Drop Rows" else "Too many to drop; capping is safer.")
         
-        results.append({
-            "Column": col,
-            "Lower Fence": round(lower_fence, 4),
-            "Upper Fence": round(upper_fence, 4),
-            "Outlier Count (Sample)": outlier_count,
-            "Recommended Action": action,
-            "Reason": reason
-        })
+#         results.append({
+#             "Column": col,
+#             "Lower Fence": round(lower_fence, 4),
+#             "Upper Fence": round(upper_fence, 4),
+#             "Outlier Count (Sample)": outlier_count,
+#             "Recommended Action": action,
+#             "Reason": reason
+#         })
         
-    if not results:
-        return {"type": "table", "data": [], "note": "No univariate IQR outliers detected in the numeric columns."}
+#     if not results:
+#         return {"type": "table", "data": [], "note": "No univariate IQR outliers detected in the numeric columns."}
         
-    return {"type": "table", "data": results}
+#     return {"type": "table", "data": results}
 
-import json
 
 @process(
     name="context_aware_cleaning_plan",
@@ -407,3 +408,196 @@ def nullity_matrix(dco: DataContextObject, **_):
         
     null_matrix = df.isna().astype(int).to_dict(orient="list")
     return {"type": "null_matrix", "data": null_matrix, "rows": len(df)}
+
+@process(
+    name="run_automl_suite",
+    description="Trains multiple baseline algorithms on the reservoir sample and compares performance metrics.",
+    cost=ProcessCost.FREE,
+    category="automl"
+)
+def run_automl_suite(dco: DataContextObject, **_):
+    df = _load_sample(dco)
+    target = dco.target.column
+    
+    if target not in df.columns:
+        return {"type": "text", "data": "Target column not found in data sample."}
+        
+    df = df.dropna(subset=[target])
+    if len(df) < 40:
+        return {"type": "text", "data": "Insufficient row count in data sample to run training suites safely."}
+        
+    X = df.drop(columns=[target])
+    y = df[target]
+    
+    # --- BULLETPROOF PREPROCESSING ---
+    for col in X.columns:
+        # Check if the column is text/categorical
+        if X[col].dtype == 'object' or X[col].dtype.name == 'category' or pd.api.types.is_string_dtype(X[col]):
+            # Impute missing text with the mode
+            mode_series = X[col].mode()
+            fill_val = mode_series[0] if not mode_series.empty else "Missing"
+            X[col] = X[col].fillna(fill_val)
+            # Encode strings to integers safely
+            X[col] = LabelEncoder().fit_transform(X[col].astype(str))
+        else:
+            # Impute missing numbers with the median
+            median_val = X[col].median()
+            fill_val = median_val if not pd.isna(median_val) else 0
+            X[col] = X[col].fillna(fill_val)
+    # ---------------------------------
+    
+    # Scale features for stable linear model performance
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    # Task Detection
+    is_classification = dco.columns[target].dtype.upper() in ["VARCHAR", "TEXT", "BOOLEAN"] or dco.columns[target].distinct_count < 20
+    
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+    leaderboard = []
+    best_features = []
+
+    if is_classification:
+        y_train = LabelEncoder().fit_transform(y_train.astype(str))
+        y_test = LabelEncoder().fit_transform(y_test.astype(str))
+        
+        # Model 1: Logistic Regression
+        lr = LogisticRegression(max_iter=1000, random_state=42)
+        lr.fit(X_train, y_train)
+        lr_preds = lr.predict(X_test)
+        leaderboard.append({"Model": "Logistic Regression", "Accuracy": accuracy_score(y_test, lr_preds), "F1-Score": f1_score(y_test, lr_preds, average='weighted')})
+        
+        # Model 2: Random Forest
+        rf = RandomForestClassifier(n_estimators=50, random_state=42, n_jobs=-1)
+        rf.fit(X_train, y_train)
+        rf_preds = rf.predict(X_test)
+        leaderboard.append({"Model": "Random Forest", "Accuracy": accuracy_score(y_test, rf_preds), "F1-Score": f1_score(y_test, rf_preds, average='weighted')})
+        
+        best_features = rf.feature_importances_
+        
+    else:
+        # Model 1: Ridge Regression
+        ridge = Ridge(alpha=1.0)
+        ridge.fit(X_train, y_train)
+        ridge_preds = ridge.predict(X_test)
+        leaderboard.append({"Model": "Ridge Regression", "R² Score": r2_score(y_test, ridge_preds), "MAE": mean_absolute_error(y_test, ridge_preds)})
+        
+        # Model 2: Random Forest
+        rf = RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1)
+        rf.fit(X_train, y_train)
+        rf_preds = rf.predict(X_test)
+        leaderboard.append({"Model": "Random Forest", "R² Score": r2_score(y_test, rf_preds), "MAE": mean_absolute_error(y_test, rf_preds)})
+        
+        best_features = rf.feature_importances_
+
+    # Format Feature Importance
+    feature_imp = pd.DataFrame({"Feature": X.columns, "Importance": best_features})
+    feature_imp = feature_imp.sort_values("Importance", ascending=False).head(10).to_dict(orient="records")
+
+    return {
+        "type": "automl_results",
+        "task": "Classification" if is_classification else "Regression",
+        "leaderboard": leaderboard,
+        "feature_importance": feature_imp
+    }
+
+@process(
+    name="analyze_outliers_smart",
+    description="Uses LLM reasoning combined with statistical IQR fences to determine safe outlier handling strategies.",
+    cost=ProcessCost.FREE, # Update to ProcessCost.LLM if you have a cost tracking system
+    category="model_suggestion"
+)
+def analyze_outliers_smart(dco: DataContextObject, **_):
+    df = _load_sample(dco)
+    protected_target = dco.target.column if dco.target and dco.target.confirmed_by_user else None
+    
+    stats_payload = {}
+    fences = {}
+    
+    # 1. The Engine: Calculate hard statistics (Skip binary flags)
+    for col in df.select_dtypes(include=['number', 'float', 'int']).columns:
+        # Guard Clause: Skip binary/low-cardinality columns like is_weekend entirely
+        if df[col].nunique() < 5:
+            continue
+            
+        q1 = df[col].quantile(0.25)
+        q3 = df[col].quantile(0.75)
+        iqr = q3 - q1
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        
+        outliers = int(((df[col] < lower) | (df[col] > upper)).sum())
+        
+        if outliers > 0:
+            # Fetch the RAG domain context we injected earlier
+            context = getattr(dco.columns.get(col), 'description', 'No context provided.')
+            
+            stats_payload[col] = {
+                "outliers": outliers,
+                "is_target": (col == protected_target),
+                "context": context
+            }
+            # Save fences for the UI table later
+            fences[col] = {"lower": lower, "upper": upper}
+
+    if not stats_payload:
+        return {"type": "text", "data": "No significant outliers detected in continuous numeric columns."}
+
+    # 2. The Brain: Batched LLM Prompting
+    # 2. The Brain: Batched LLM Prompting with STRICT Context Prioritization
+    prompt = f"""
+    You are an Expert Data Scientist analyzing dataset outliers.
+    Review the following columns, their outlier counts, and the specific domain context provided by the user.
+
+    Data to analyze:
+    {json.dumps(stats_payload, indent=2)}
+
+    --- THE GOLDEN RULE ---
+    The `user_provided_context` is your ultimate source of truth. If the context implies that extreme values are normal, expected, or critical to the business logic, you MUST NOT drop or cap them. 
+
+    For EACH column, determine the safest action:
+    - "Drop Rows": ONLY if the value is biologically/physically impossible or clearly a logging error.
+    - "Cap (Winsorize)": If the extreme value is valid but needs smoothing to prevent model skewing.
+    - "Ignore": You MUST use this if "is_target" is true, OR if the `user_provided_context` indicates extreme values are legitimate signals (e.g., fraud amounts, flash sale spikes).
+
+    Return a valid JSON object where keys are the column names, and values are objects with "action" and "reason".
+    Format:
+    {{
+      "column_name": {{"action": "Ignore", "reason": "Based on the user context, these high transaction amounts represent valid VIP purchases, not errors."}}
+    }}
+    """
+    
+    # 3. Execute and Parse
+    try:
+        fast_llm = st.session_state.get("_test_fast_llm_override") or get_llm("fast")
+        response = fast_llm.invoke(prompt).content.strip()
+        
+        # Clean markdown formatting if present
+        if "```json" in response:
+            response = response.split("```json")[1].split("```")[0].strip()
+        elif "```" in response:
+            response = response.split("```")[1].split("```")[0].strip()
+            
+        decisions = json.loads(response)
+    except Exception as e:
+        return {"type": "text", "data": f"Failed to generate intelligent cleaning plan: {str(e)}"}
+
+    # 4. Construct Final UI Payload
+    outlier_data = []
+    for col, stats in stats_payload.items():
+        decision = decisions.get(col, {"action": "Manual Review", "reason": "LLM failed to analyze."})
+        
+        outlier_data.append({
+            "Column": col,
+            "Lower Fence": f"{fences[col]['lower']:.4f}",
+            "Upper Fence": f"{fences[col]['upper']:.4f}",
+            "Outlier Count": stats["outliers"],
+            "Recommended Action": decision["action"],
+            "Reason": decision["reason"]
+        })
+        
+    # Return using your existing render payload type for tables
+    return {
+        "type": "table",
+        "data": outlier_data
+    }

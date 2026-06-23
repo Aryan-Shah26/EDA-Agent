@@ -21,6 +21,7 @@ from src.tools.registry import REGISTRY, ProcessCost
 from src.tools.scheduler import run_selected
 from src.agent.llm_router import get_llm
 from .render import render_result
+from src.tools.builtin_processes import run_automl_suite
 
 
 def render_upload_section():
@@ -150,48 +151,89 @@ def render_data_profile_tab():
     st.caption("Fetch external context (Web/LLM) to help the agent understand this dataset.")
     render_category_checklist(None, "context")
 
+    st.divider()
+    st.markdown("#### Domain Knowledge & Context Injection")
+    st.caption("Upload a data dictionary, markdown documentation, or notes file to teach the agent about your specific business rules.")
+    
+    uploaded_doc = st.file_uploader("Upload Data Dictionary (.txt, .md)", type=["txt", "md"], key="domain_doc_uploader")
+    
+    if uploaded_doc is not None:
+        if "domain_context_loaded" not in st.session_state or st.session_state.get("loaded_doc_name") != uploaded_doc.name:
+            with st.spinner("Analyzing documentation and mapping to columns..."):
+                doc_text = uploaded_doc.read().decode("utf-8")
+                
+                # Fetch available column names from current dco
+                col_names = list(dco.columns.keys())
+                
+                # Run the RAG parser
+                from src.tools.rag_tools import parse_domain_dictionary
+                mappings = parse_domain_dictionary(doc_text, col_names)
+                
+                # Update dco columns with descriptions
+                for col_name, desc in mappings.items():
+                    if col_name in dco.columns:
+                        dco.columns[col_name].description = desc
+                        
+                st.session_state.domain_context_loaded = True
+                st.session_state.loaded_doc_name = uploaded_doc.name
+                st.success(f"Successfully mapped context for {len(mappings)} columns!")
+
 
 def render_target_tab():
     dco = st.session_state.dco
     
     st.subheader("Target Configuration")
-    if dco.target.confirmed_by_user and dco.target.column:
-        st.success(f"Confirmed Target: **{dco.target.column}**")
-        for f in (dco.target.health or {}).get("flags", []):
-            level = {"critical": st.error, "warning": st.warning}.get(f["severity"], st.info)
-            level(f["detail"])
-        if st.button("Change target"):
-            dco.target.confirmed_by_user = False
-            dco.target.column = None
-            st.rerun()
-    else:
-        candidates = dco.target.candidates or detect_target_candidates(dco)
-        dco.target.candidates = candidates
-        candidate_names = [c["column"] for c in candidates]
-        other_columns = [c for c in dco.columns if c not in candidate_names]
-        options = ["-- none --"] + candidate_names + other_columns
-
-        choice = st.selectbox(
-            "Select a target/label column to predict:",
-            options, index=1 if candidates else 0,
-        )
-        if choice != "-- none --" and st.button("Confirm target", type="primary"):
-            class_counts = get_class_counts(st.session_state.csv_path, choice)
-            health = audit_target_health(dco, choice, class_counts=class_counts)
-            dco.target.column = choice
-            dco.target.confirmed_by_user = True
-            dco.target.health = health
-            st.rerun()
-            
-    st.divider()
     
-    if not dco.target.column:
+    # 1. ALWAYS RENDER THE SELECTION UI FIRST
+    col_names = list(dco.columns.keys())
+    # Remember the previous selection if it exists
+    default_idx = col_names.index(dco.target.column) if dco.target.column in col_names else 0
+    
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        selected_target = st.selectbox("Select Target Variable:", options=col_names, index=default_idx)
+    with c2:
+        st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True) # Aligns button with selectbox
+        if st.button("Confirm Target", type="primary", use_container_width=True):
+            dco.target.column = selected_target
+            dco.target.confirmed_by_user = True
+            st.rerun()
+
+    # 2. THE GUARD CLAUSE (Blocks analysis until confirmed)
+    if not dco.target.column or not dco.target.confirmed_by_user:
         st.info("Please select and confirm a Target Column above to unlock target analysis.")
         return
 
-    st.markdown(f"#### Target Analysis: `{dco.target.column}`")
+    # 3. DOWNSTREAM ANALYSIS (Safe to proceed)
+    target_col = dco.target.column
+    prof = dco.columns[target_col]
     
-    # Filter only processes that REQUIRE a target
+    st.success(f"Confirmed Target: **{target_col}**")
+    
+    # --- TASK DETECTION ROUTER ---
+    is_classification = prof.dtype.upper() in ["VARCHAR", "TEXT", "BOOLEAN", "CATEGORY"] or (prof.distinct_count is not None and prof.distinct_count < 20)
+    
+    if is_classification:
+        st.info(f"**Task Detected:** Classification ({prof.distinct_count} unique classes)")
+        
+        # Paste your original class imbalance warning code here
+        # (e.g., calculating the minority class percentage and showing a warning)
+        
+    else:
+        st.info("**Task Detected:** Regression (Continuous Variable)")
+        st.caption("Target is continuous. Displaying distribution metrics instead of class balance.")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Min", f"{prof.min_val:.2f}" if prof.min_val is not None else "-")
+        col2.metric("Max", f"{prof.max_val:.2f}" if prof.max_val is not None else "-")
+        col3.metric("Mean", f"{prof.mean:.2f}" if prof.mean is not None else "-")
+        col4.metric("Std Dev", f"{prof.std:.2f}" if prof.std is not None else "-")
+        
+    st.divider()
+
+    # 4. RENDER THE ANALYSIS TOOLS
+    st.markdown(f"#### Target Analysis: `{target_col}`")
+    
     target_processes = [s for s in REGISTRY.list() if s.requires_target]
     
     if not target_processes:
@@ -257,3 +299,38 @@ def render_category_checklist(title: str, category: str):
         for name, result in st.session_state.process_results.items():
             if REGISTRY.get(name).category == category:
                 render_result(name, result)
+
+
+def render_automl_tab():
+    dco = st.session_state.dco
+    if not dco:
+        return
+
+    st.subheader("Automated Machine Learning Suite")
+    
+    # 1. Target Column Guard Clause
+    if not dco.target.column or not dco.target.confirmed_by_user:
+        st.info("Please go to the **Target Analysis** tab and confirm your target variable before training models.")
+        return
+
+    st.markdown(f"Current Target Objective: `{dco.target.column}`")
+    st.caption("This suite trains multiple baseline algorithms using a stratified train-test split on your reservoir data sample to build a comparative performance leaderboard.")
+    
+    st.divider()
+
+    # 2. Action Trigger Button
+    if st.button("Run AutoML Suite", type="primary", use_container_width=True):
+        with st.spinner("Partitioning data, training algorithms, and calculating cross-metrics..."):
+            try:
+                # Direct invocation of the process tool bypasses checklist bottlenecks
+                results = run_automl_suite(dco)
+                st.session_state["automl_cache"] = results
+            except Exception as e:
+                st.error(f"AutoML Suite Execution Failed: {str(e)}")
+                
+    # 3. Persistent Render Cache Check
+    if "automl_cache" in st.session_state:
+        results = st.session_state["automl_cache"]
+        
+        # Pass directly to your custom renderer in ui/render.py
+        render_result("run_automl_suite", results)  

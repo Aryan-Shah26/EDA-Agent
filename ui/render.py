@@ -24,8 +24,16 @@ def render_result(name: str, result):
     if result.get("note"):
         st.caption(result["note"])
 
+    if not result:
+        return
+        
     rtype = result.get("type")
-    if rtype == "table":
+    
+    if rtype == "text":
+        st.markdown(result.get("data"))
+    elif rtype == "automl_results":
+        _render_automl_results(result)
+    elif rtype == "table":
         _render_table(result)
     elif rtype == "heatmap":
         _render_heatmap(result)
@@ -39,6 +47,7 @@ def render_result(name: str, result):
         _render_altair_boxplots(result)
     elif rtype == "null_matrix":
         _render_null_matrix(result)
+
     else:
         st.json(result)
 
@@ -154,3 +163,29 @@ def _render_null_matrix(result):
         spine.set_visible(False)
         
     st.pyplot(fig)
+
+def _render_automl_results(result):
+    task = result.get("task")
+    leaderboard_data = result.get("leaderboard", [])
+    feature_imp_data = result.get("feature_importance", [])
+    
+    st.markdown(f"### Model Performance Leaderboard ({task})")
+    
+    if leaderboard_data:
+        df_leaderboard = pd.DataFrame(leaderboard_data)
+        # Format metric columns beautifully using dynamic styling
+        score_cols = [c for c in df_leaderboard.columns if c != "Model"]
+        format_config = {col: "{:.4f}" for col in score_cols}
+        st.dataframe(df_leaderboard.style.format(format_config), hide_index=True, use_container_width=True)
+    
+    st.divider()
+    
+    if feature_imp_data:
+        st.markdown("### Tree Ensemble Feature Importance Insights")
+        st.caption("Extracted from the Random Forest model execution bounds.")
+        
+        df_imp = pd.DataFrame(feature_imp_data)
+        df_imp["Feature"] = df_imp["Feature"].apply(lambda x: str(x).replace("_", " ").title())
+        
+        st.bar_chart(df_imp.set_index("Feature")["Importance"])
+
